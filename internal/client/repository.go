@@ -660,6 +660,31 @@ func (bs *blobs) Stat(ctx context.Context, dgst digest.Digest) (v1.Descriptor, e
 }
 
 func (bs *blobs) Get(ctx context.Context, dgst digest.Digest) ([]byte, error) {
+	// For large blobs, attempt parallel chunked download via Range requests
+	// against the storage backend (e.g. S3 pre-signed URL).
+	desc, err := bs.statter.Stat(ctx, dgst)
+	if err != nil {
+		return nil, err
+	}
+	if desc.Size >= defaultChunkedThreshold {
+		ref, err := reference.WithDigest(bs.name, dgst)
+		if err != nil {
+			return nil, err
+		}
+		blobURL, err := bs.ub.BuildBlobURL(ref)
+		if err != nil {
+			return nil, err
+		}
+		data, err := chunkedGet(ctx, bs.client.Transport, blobURL, desc.Size, dgst)
+		if data != nil {
+			return data, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		// chunkedGet returned nil,nil — not applicable, fall through.
+	}
+
 	reader, err := bs.Open(ctx, dgst)
 	if err != nil {
 		return nil, err
@@ -677,6 +702,19 @@ func (bs *blobs) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekClose
 	blobURL, err := bs.ub.BuildBlobURL(ref)
 	if err != nil {
 		return nil, err
+	}
+
+	// For large blobs, attempt parallel chunked download.
+	desc, err := bs.statter.Stat(ctx, dgst)
+	if err == nil && desc.Size >= defaultChunkedThreshold {
+		data, err := chunkedGet(ctx, bs.client.Transport, blobURL, desc.Size, dgst)
+		if data != nil {
+			return readSeekNopCloser{bytes.NewReader(data)}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		// Not applicable, fall through to sequential download.
 	}
 
 	return transport.NewHTTPReadSeeker(ctx, bs.client, blobURL, func(resp *http.Response) error {
